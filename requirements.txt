@@ -1,0 +1,2 @@
+# gRPC client runtime for LND access
+grpcio>=1.60.0
