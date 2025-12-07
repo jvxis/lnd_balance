@@ -397,6 +397,40 @@ def aggregate_monthly(
     return result
 
 
+def aggregate_year_to_date(conn: sqlite3.Connection, tzinfo: timezone) -> Optional[Tuple[str, str, int, int, int]]:
+    """
+    Aggregate totals for the current calendar year based on available DB rows.
+    Returns (start_date, end_date, revenue, cost, profit) or None if no rows in year.
+    """
+    now_local = datetime.now(tzinfo)
+    year = now_local.year
+    start_bound = f"{year:04d}-01-01"
+    end_bound = f"{year:04d}-12-31"
+
+    cur = conn.execute(
+        """
+        SELECT MIN(date), MAX(date),
+               SUM(forward_fees_sat) as revenue,
+               SUM(rebalance_fees_sat) as cost,
+               SUM(net_profit_sat) as profit
+        FROM daily_fees
+        WHERE date BETWEEN ? AND ?
+        """,
+        (start_bound, end_bound),
+    )
+    row = cur.fetchone()
+    if not row or row[0] is None:
+        return None
+    start_date, end_date, revenue, cost, profit = row
+    return (
+        start_date,
+        end_date,
+        int(revenue or 0),
+        int(cost or 0),
+        int(profit or 0),
+    )
+
+
 def first_day_for_months_back(today_local: date, months_back: int) -> date:
     """Return the first day of the month that is `months_back` before the current month."""
     months_back = max(months_back, 0)
@@ -916,6 +950,7 @@ def main() -> None:
     monthly = aggregate_monthly(conn, tzinfo, months_total)
     yesterday_local = datetime.now(tzinfo).date() - timedelta(days=1)
     dminus1_record = fetch_daily_row(conn, yesterday_local.isoformat())
+    ytd_row = aggregate_year_to_date(conn, tzinfo)
 
     print_run_summary(
         new_records=new_records,
@@ -925,6 +960,7 @@ def main() -> None:
         db_path=args.db_path,
         months=months_total,
         monthly_rows=monthly,
+        ytd_row=ytd_row,
         alias=alias,
         pubkey=our_pubkey,
         missing_count=len(missing_dates),
@@ -941,6 +977,7 @@ def print_run_summary(
     db_path: str,
     months: int,
     monthly_rows: List[Tuple[str, int, int, int]],
+    ytd_row: Optional[Tuple[str, str, int, int, int]],
     alias: str,
     pubkey: str,
     missing_count: int,
@@ -975,6 +1012,8 @@ def print_run_summary(
     print_daily_report(dminus1_record, tzinfo)
     print()
     print_monthly_report(monthly_rows, months)
+    print()
+    print_ytd_report(ytd_row)
 
 
 def print_monthly_report(monthly_rows: List[Tuple[str, int, int, int]], months: int) -> None:
@@ -1005,6 +1044,19 @@ def print_monthly_report(monthly_rows: List[Tuple[str, int, int, int]], months: 
             print(
                 f"    {month_key}: {fmt_revenue_cost(revenue, cost, profit)}"
             )
+
+
+def print_ytd_report(ytd_row: Optional[Tuple[str, str, int, int, int]]) -> None:
+    """Print year-to-date totals based on available DB rows."""
+    if ytd_row is None:
+        print("📅 Current year results: no data stored for this year.")
+        return
+    start_date, end_date, revenue, cost, profit = ytd_row
+    print(bold("📅 Current Year Results:"))
+    print(
+        f"  {start_date} -> {end_date}: "
+        f"{fmt_revenue_cost(revenue, cost, profit)}"
+    )
 
 
 def print_daily_report(dminus1_record: Optional[DailyFeeRecord], tzinfo: timezone) -> None:
