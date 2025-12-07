@@ -39,6 +39,16 @@ from zoneinfo import ZoneInfo
 
 import lightning_pb2  # type: ignore
 import lightning_pb2_grpc  # type: ignore
+
+# ANSI styling (used when stdout is a TTY and NO_COLOR is not set)
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+GREEN = "\033[32m"
+RED = "\033[31m"
+YELLOW = "\033[33m"
+BLUE = "\033[34m"
+CYAN = "\033[36m"
 # ------------------------------------------------------------------------------
 # Data classes
 # ------------------------------------------------------------------------------
@@ -85,6 +95,62 @@ class DailyFeeRecord:
 def print_error(message: str) -> None:
     """Prints an error message to stderr."""
     sys.stderr.write(f"Error: {message}\n")
+
+
+def supports_color() -> bool:
+    """Detect whether to emit ANSI colors."""
+    if os.environ.get("NO_COLOR"):
+        return False
+    return sys.stdout.isatty()
+
+
+COLOR_ENABLED = supports_color()
+
+
+def c(text: str, color_code: str) -> str:
+    """Wrap text in ANSI color if enabled."""
+    if not COLOR_ENABLED:
+        return text
+    return f"{color_code}{text}{RESET}"
+
+
+def bold(text: str) -> str:
+    if not COLOR_ENABLED:
+        return text
+    return f"{BOLD}{text}{RESET}"
+
+
+def dim(text: str) -> str:
+    if not COLOR_ENABLED:
+        return text
+    return f"{DIM}{text}{RESET}"
+
+
+def fmt_sat(value: int) -> str:
+    """Pretty format sat values with thousands separators."""
+    return f"{value:,} sats"
+
+
+def fmt_profit(value: int) -> str:
+    """Color profit/loss with sign."""
+    text = f"{value:,} sats"
+    if value > 0:
+        return c(text, GREEN)
+    if value < 0:
+        return c(text, RED)
+    return text
+
+
+def fmt_revenue_cost(revenue: int, cost: int, profit: int) -> str:
+    return (
+        f"rev {fmt_sat(revenue)}, "
+        f"cost {fmt_sat(cost)}, "
+        f"net {fmt_profit(profit)}"
+    )
+
+
+def pad(label: str, width: int = 26) -> str:
+    return label.ljust(width)
 
 
 def load_env_config() -> Optional[EnvConfig]:
@@ -824,26 +890,27 @@ def print_run_summary(
 ) -> None:
     """Print summary of this run plus daily D-1 and monthly aggregation."""
     tz_label = tzinfo.tzname(datetime.now(tzinfo)) or ""
-    print(f"Date window requested: {start_date.isoformat()} -> {end_date.isoformat()} (tz={tz_label})")
-    print(f"Database: {db_path}")
+    print(bold(c("⚡ Lightning Routing Fees", CYAN)))
+    print(dim(f"Date window: {start_date.isoformat()} -> {end_date.isoformat()} (tz={tz_label})"))
+    print(dim(f"Database: {db_path}"))
 
     if processed_count == 0:
         if missing_count == 0:
-            print("No new daily rows inserted (database already up to date through requested range).")
+                print(c("No new daily rows inserted (already up to date).", YELLOW))
         else:
-            print("No daily rows inserted.")
+            print(c("No daily rows inserted.", YELLOW))
     else:
-        print(f"Inserted {processed_count} daily row(s):")
+        print(c(f"Inserted {processed_count} daily row(s):", GREEN))
         for rec in sorted(new_records, key=lambda r: r.date_str):
             print(
-                f"  {rec.date_str}: forward={rec.forward_fees_sat} sats, "
-                f"rebalance={rec.rebalance_fees_sat} sats, net={rec.net_profit_sat} sats"
+                f"  📅 {rec.date_str}: "
+                f"{fmt_revenue_cost(rec.forward_fees_sat, rec.rebalance_fees_sat, rec.net_profit_sat)}"
             )
 
     if alias:
-        print(f"Node alias: {alias}")
+        print(f"{pad('Node alias:')}{alias}")
     if pubkey:
-        print(f"Node pubkey: {pubkey}")
+        print(f"{pad('Node pubkey:')}{pubkey}")
 
     print()
     print_daily_report(dminus1_record, tzinfo)
@@ -858,27 +925,26 @@ def print_monthly_report(monthly_rows: List[Tuple[str, int, int, int]], months: 
         return
 
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    print(f"Monthly routing profit snapshot (as of {today_str}):")
+    print(bold(f"📆 Monthly routing profit snapshot (as of {today_str})"))
 
     current = monthly_rows[0]
     print(
-        f"  Current month ({current[0]}): revenue={current[1]} sats, "
-        f"rebalance_cost={current[2]} sats, profit={current[3]} sats"
+        f"  ⭐ Current month ({current[0]}): "
+        f"{fmt_revenue_cost(current[1], current[2], current[3])}"
     )
 
     if len(monthly_rows) >= 2:
         last = monthly_rows[1]
         print(
-            f"  Last month ({last[0]}): revenue={last[1]} sats, "
-            f"rebalance_cost={last[2]} sats, profit={last[3]} sats"
+            f"  🗓️  Last month ({last[0]}): "
+            f"{fmt_revenue_cost(last[1], last[2], last[3])}"
         )
 
     if len(monthly_rows) > 2:
-        print("  Previous months:")
+        print("  🕰️  Previous months:")
         for month_key, revenue, cost, profit in monthly_rows[2:]:
             print(
-                f"    {month_key}: revenue={revenue} sats, "
-                f"rebalance_cost={cost} sats, profit={profit} sats"
+                f"    {month_key}: {fmt_revenue_cost(revenue, cost, profit)}"
             )
 
 
@@ -886,13 +952,12 @@ def print_daily_report(dminus1_record: Optional[DailyFeeRecord], tzinfo: timezon
     """Print D-1 daily profit."""
     yesterday = datetime.now(tzinfo).date() - timedelta(days=1)
     if dminus1_record is None:
-        print(f"D-1 ({yesterday.isoformat()}): no data stored.")
+        print(c(f"D-1 ({yesterday.isoformat()}): no data stored.", YELLOW))
         return
-    print("D-1 daily profit:")
+    print(bold("📅 D-1 daily profit:"))
     print(
-        f"  {dminus1_record.date_str}: revenue={dminus1_record.forward_fees_sat} sats, "
-        f"rebalance_cost={dminus1_record.rebalance_fees_sat} sats, "
-        f"profit={dminus1_record.net_profit_sat} sats"
+        f"  {dminus1_record.date_str}: "
+        f"{fmt_revenue_cost(dminus1_record.forward_fees_sat, dminus1_record.rebalance_fees_sat, dminus1_record.net_profit_sat)}"
     )
 
 
