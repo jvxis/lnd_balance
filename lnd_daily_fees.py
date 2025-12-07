@@ -584,15 +584,19 @@ def get_rebalance_fees(
 ) -> Tuple[int, List[RebalanceDetail]]:
     """
     Sum fees for payments that qualify as rebalances in the given window.
+    Definition (aligned with lncli script):
+      - Payment succeeded.
+      - First succeeded HTLC route has at least 2 hops.
+      - Last hop pubkey == our_pubkey.
+      - First chan_id != last chan_id (left and returned via different channels).
     If memo_match is True, also treat descriptions containing "rebalance" as rebalances.
     """
-    total_fee_sat = 0
+    total_fee_msat = 0
     details: List[RebalanceDetail] = []
     decode_cache: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
 
     index_offset = 0
     page_size = 500
-    early_exit = False
 
     while True:
         req = lightning_pb2.ListPaymentsRequest()
@@ -603,12 +607,12 @@ def get_rebalance_fees(
             req.index_offset = index_offset
         if "max_payments" in req.DESCRIPTOR.fields_by_name:
             req.max_payments = page_size
-        if "reversed" in req.DESCRIPTOR.fields_by_name:
-            req.reversed = True  # fetch newest first to allow early cutoff
         if "creation_date_start" in req.DESCRIPTOR.fields_by_name:
             req.creation_date_start = start_ts
         if "creation_date_end" in req.DESCRIPTOR.fields_by_name:
             req.creation_date_end = end_ts
+        if "paginate_forwards" in req.DESCRIPTOR.fields_by_name:
+            req.paginate_forwards = True
 
         try:
             resp = lightning_stub.ListPayments(req)
@@ -622,9 +626,6 @@ def get_rebalance_fees(
 
         for payment in payments:
             timestamp = _extract_payment_timestamp(payment)
-            if timestamp < start_ts and getattr(req, "reversed", False):
-                early_exit = True
-                continue
             if timestamp < start_ts or timestamp > end_ts:
                 continue
 
@@ -643,7 +644,8 @@ def get_rebalance_fees(
             is_rebalance = False
             # Strict definition: self-pay AND traversed two distinct channels (out!=in).
             if (
-                dest_pubkey is not None
+                hop_count_route >= 2
+                and dest_pubkey is not None
                 and dest_pubkey == our_pubkey
                 and first_chan_id is not None
                 and last_chan_id is not None
@@ -657,9 +659,10 @@ def get_rebalance_fees(
 
             if is_rebalance:
                 fee_sat = _extract_payment_fee_sat(payment)
+                fee_msat = _extract_payment_fee_msat(payment)
                 amt_sat = _extract_payment_amount_sat(payment)
                 hop_count = _extract_hop_count(payment)
-                total_fee_sat += fee_sat
+                total_fee_msat += fee_msat
                 details.append(
                     RebalanceDetail(
                         payment_hash=getattr(payment, "payment_hash", ""),
@@ -674,10 +677,10 @@ def get_rebalance_fees(
             break
         index_offset = next_offset
 
-        if early_exit or len(payments) < page_size:
+        if len(payments) < page_size:
             break
 
-    return total_fee_sat, details
+    return total_fee_msat // 1000, details
 
 
 def _extract_payment_timestamp(payment) -> int:
@@ -752,7 +755,7 @@ def _extract_route_endpoints(payment) -> Tuple[Optional[int], Optional[int], Opt
         if status == succ_value or status == 1:
             route = getattr(htlc, "route", None)
             hops = getattr(route, "hops", None) if route else None
-            if hops:
+            if hops and len(hops) >= 2:
                 first_chan = getattr(hops[0], "chan_id", None)
                 last_chan = getattr(hops[-1], "chan_id", None)
                 last_pubkey = getattr(hops[-1], "pub_key", None)
@@ -772,6 +775,15 @@ def _extract_payment_fee_sat(payment) -> int:
         return int(payment.fee_sat)
     if hasattr(payment, "fee_msat"):
         return int(payment.fee_msat // 1000)
+    return 0
+
+
+def _extract_payment_fee_msat(payment) -> int:
+    """Extract fee in millisatoshis from a payment."""
+    if hasattr(payment, "fee_msat"):
+        return int(payment.fee_msat)
+    if hasattr(payment, "fee_sat"):
+        return int(payment.fee_sat) * 1000
     return 0
 
 
