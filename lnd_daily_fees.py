@@ -635,12 +635,19 @@ def get_rebalance_fees(
                 payment, lightning_stub, decode_cache
             )
 
-            is_internal_flag = bool(getattr(payment, "is_internal", False))
+            first_chan_id, last_chan_id, last_pubkey = _extract_route_endpoints(payment)
 
-            is_rebalance = (
-                is_internal_flag
-                or (dest is not None and dest == our_pubkey)
-            )
+            # Prefer the last hop pubkey from the route; fall back to decoded dest.
+            dest_pubkey = last_pubkey or dest
+
+            is_rebalance = False
+            if dest_pubkey is not None and dest_pubkey == our_pubkey:
+                # Circular/self-payment. If we have chan IDs for in/out, require they differ.
+                if first_chan_id is not None and last_chan_id is not None:
+                    is_rebalance = first_chan_id != last_chan_id
+                else:
+                    # If channel IDs are missing, still treat as rebalance to avoid undercount.
+                    is_rebalance = True
 
             if not is_rebalance and memo_match:
                 if "rebalance" in (description or "").lower():
@@ -730,6 +737,30 @@ def _extract_destination_and_description(
                 decode_cache[payreq] = (None, None)
 
     return dest, description
+
+
+def _extract_route_endpoints(payment) -> Tuple[Optional[int], Optional[int], Optional[str]]:
+    """
+    Extract first/last channel IDs and last hop pubkey from the first succeeded HTLC route.
+    Returns (first_chan_id, last_chan_id, last_pubkey).
+    """
+    for htlc in getattr(payment, "htlcs", []):
+        status = getattr(htlc, "status", None)
+        succ_value = getattr(lightning_pb2.HTLCAttempt.HTLCStatus, "SUCCEEDED", 1)
+        if status == succ_value or status == 1:
+            route = getattr(htlc, "route", None)
+            hops = getattr(route, "hops", None) if route else None
+            if hops:
+                first_chan = getattr(hops[0], "chan_id", None)
+                last_chan = getattr(hops[-1], "chan_id", None)
+                last_pubkey = getattr(hops[-1], "pub_key", None)
+                return (
+                    int(first_chan) if first_chan is not None else None,
+                    int(last_chan) if last_chan is not None else None,
+                    last_pubkey,
+                )
+            break
+    return None, None, None
 
 
 def _extract_payment_fee_sat(payment) -> int:
