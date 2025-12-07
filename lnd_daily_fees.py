@@ -580,9 +580,11 @@ def get_rebalance_fees(
     our_pubkey: str,
     start_ts: int,
     end_ts: int,
+    memo_match: bool = False,
 ) -> Tuple[int, List[RebalanceDetail]]:
     """
     Sum fees for payments that qualify as rebalances in the given window.
+    If memo_match is True, also treat descriptions containing "rebalance" as rebalances.
     """
     total_fee_sat = 0
     details: List[RebalanceDetail] = []
@@ -634,13 +636,15 @@ def get_rebalance_fees(
             )
 
             is_internal_flag = bool(getattr(payment, "is_internal", False))
-            description_lower = (description or "").lower()
 
             is_rebalance = (
                 is_internal_flag
                 or (dest is not None and dest == our_pubkey)
-                or ("rebalance" in description_lower)
             )
+
+            if not is_rebalance and memo_match:
+                if "rebalance" in (description or "").lower():
+                    is_rebalance = True
 
             if is_rebalance:
                 fee_sat = _extract_payment_fee_sat(payment)
@@ -791,6 +795,11 @@ def parse_args() -> argparse.Namespace:
         default="lnd_fees.sqlite",
         help="Path to SQLite database file for cached daily results.",
     )
+    parser.add_argument(
+        "--memo-rebalance",
+        action="store_true",
+        help="Consider payments whose description/memo contains 'rebalance' as rebalances (heuristic; off by default).",
+    )
     return parser.parse_args()
 
 
@@ -837,7 +846,11 @@ def main() -> None:
                 lightning_stub, tr.start_ts_utc, tr.end_ts_utc
             )
             rebalance_fees, _ = get_rebalance_fees(
-                lightning_stub, our_pubkey, tr.start_ts_utc, tr.end_ts_utc
+                lightning_stub,
+                our_pubkey,
+                tr.start_ts_utc,
+                tr.end_ts_utc,
+                memo_match=args.memo_rebalance,
             )
             net_profit = forward_fees - rebalance_fees
             record = DailyFeeRecord(
