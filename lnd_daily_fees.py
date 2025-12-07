@@ -635,19 +635,21 @@ def get_rebalance_fees(
                 payment, lightning_stub, decode_cache
             )
 
-            first_chan_id, last_chan_id, last_pubkey = _extract_route_endpoints(payment)
+            first_chan_id, last_chan_id, last_pubkey, hop_count_route = _extract_route_endpoints(payment)
 
             # Prefer the last hop pubkey from the route; fall back to decoded dest.
             dest_pubkey = last_pubkey or dest
 
             is_rebalance = False
-            if dest_pubkey is not None and dest_pubkey == our_pubkey:
-                # Circular/self-payment. If we have chan IDs for in/out, require they differ.
-                if first_chan_id is not None and last_chan_id is not None:
-                    is_rebalance = first_chan_id != last_chan_id
-                else:
-                    # If channel IDs are missing, still treat as rebalance to avoid undercount.
-                    is_rebalance = True
+            # Strict definition: self-pay AND traversed two distinct channels (out!=in).
+            if (
+                dest_pubkey is not None
+                and dest_pubkey == our_pubkey
+                and first_chan_id is not None
+                and last_chan_id is not None
+                and first_chan_id != last_chan_id
+            ):
+                is_rebalance = True
 
             if not is_rebalance and memo_match:
                 if "rebalance" in (description or "").lower():
@@ -739,10 +741,10 @@ def _extract_destination_and_description(
     return dest, description
 
 
-def _extract_route_endpoints(payment) -> Tuple[Optional[int], Optional[int], Optional[str]]:
+def _extract_route_endpoints(payment) -> Tuple[Optional[int], Optional[int], Optional[str], int]:
     """
     Extract first/last channel IDs and last hop pubkey from the first succeeded HTLC route.
-    Returns (first_chan_id, last_chan_id, last_pubkey).
+    Returns (first_chan_id, last_chan_id, last_pubkey, hop_count).
     """
     for htlc in getattr(payment, "htlcs", []):
         status = getattr(htlc, "status", None)
@@ -758,9 +760,10 @@ def _extract_route_endpoints(payment) -> Tuple[Optional[int], Optional[int], Opt
                     int(first_chan) if first_chan is not None else None,
                     int(last_chan) if last_chan is not None else None,
                     last_pubkey,
+                    len(hops),
                 )
             break
-    return None, None, None
+    return None, None, None, 0
 
 
 def _extract_payment_fee_sat(payment) -> int:
