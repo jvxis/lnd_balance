@@ -2,9 +2,11 @@
 Lightning Network daily fee report helper.
 
 This script connects to an LND node via gRPC, fetches forwarding events and
-outgoing payments, and computes routing income (forwards) versus costs
-(rebalancing). The default time window is the previous local calendar day
-("D-1"), but custom dates can be provided via CLI flags.
+outgoing payments, computes routing income (forwards) versus costs
+(rebalancing), and caches daily results in a local SQLite database. By default
+it processes the previous local calendar day ("D-1"), backfills missing days
+within a requested range up to yesterday, and produces a monthly profit
+summary (current month + previous months via --months).
 
 Requirements:
 - Python 3.9+
@@ -25,10 +27,11 @@ from __future__ import annotations
 
 import argparse
 import os
+import sqlite3
 import sys
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 import grpc
@@ -63,6 +66,16 @@ class RebalanceDetail:
     amount_sat: int
     fee_sat: int
     hop_count: int
+
+
+@dataclass
+class DailyFeeRecord:
+    date_str: str
+    forward_fees_sat: int
+    rebalance_fees_sat: int
+    net_profit_sat: int
+    start_ts_utc: int
+    end_ts_utc: int
 
 
 # ------------------------------------------------------------------------------
@@ -134,6 +147,24 @@ def get_time_range_dminus1(tz_name: Optional[str]) -> TimeRange:
     )
 
 
+def get_time_range_for_date(target_date: date, tz_name: Optional[str]) -> TimeRange:
+    """
+    Compute local start/end for a specific date and convert to UTC timestamps.
+    """
+    tzinfo = resolve_timezone(tz_name)
+    start_local = datetime.combine(target_date, time(0, 0, 0), tzinfo)
+    end_local = datetime.combine(target_date, time(23, 59, 59), tzinfo)
+    start_ts_utc = int(start_local.astimezone(timezone.utc).timestamp())
+    end_ts_utc = int(end_local.astimezone(timezone.utc).timestamp())
+
+    return TimeRange(
+        start_ts_utc=start_ts_utc,
+        end_ts_utc=end_ts_utc,
+        start_local=start_local,
+        end_local=end_local,
+    )
+
+
 def get_time_range_from_cli(
     start_str: str, end_str: str, tz_name: Optional[str]
 ) -> Optional[TimeRange]:
@@ -165,6 +196,149 @@ def get_time_range_from_cli(
         start_local=start_local,
         end_local=end_local,
     )
+
+
+# ------------------------------------------------------------------------------
+# SQLite helpers
+# ------------------------------------------------------------------------------
+
+
+def init_db(db_path: str) -> sqlite3.Connection:
+    """Create/open the SQLite database and ensure schema exists."""
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS daily_fees (
+            date TEXT PRIMARY KEY,
+            forward_fees_sat INTEGER NOT NULL,
+            rebalance_fees_sat INTEGER NOT NULL,
+            net_profit_sat INTEGER NOT NULL,
+            start_ts_utc INTEGER NOT NULL,
+            end_ts_utc INTEGER NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    return conn
+
+
+def day_exists(conn: sqlite3.Connection, date_str: str) -> bool:
+    """Return True if a row already exists for the given YYYY-MM-DD date."""
+    cur = conn.execute("SELECT 1 FROM daily_fees WHERE date = ? LIMIT 1", (date_str,))
+    return cur.fetchone() is not None
+
+
+def insert_daily_fee(conn: sqlite3.Connection, record: DailyFeeRecord) -> None:
+    """Insert a single day's fee summary."""
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO daily_fees
+        (date, forward_fees_sat, rebalance_fees_sat, net_profit_sat, start_ts_utc, end_ts_utc)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            record.date_str,
+            record.forward_fees_sat,
+            record.rebalance_fees_sat,
+            record.net_profit_sat,
+            record.start_ts_utc,
+            record.end_ts_utc,
+        ),
+    )
+
+
+def iter_dates(start_date: date, end_date: date) -> List[date]:
+    """Inclusive list of dates from start_date to end_date."""
+    days = []
+    cur = start_date
+    while cur <= end_date:
+        days.append(cur)
+        cur += timedelta(days=1)
+    return days
+
+
+def month_keys(current_date: date, months_back: int) -> List[str]:
+    """
+    Return a list of YYYY-MM keys for current month plus N previous months.
+    months_back=0 yields only the current month.
+    """
+    keys: List[str] = []
+    year = current_date.year
+    month = current_date.month
+    for _ in range(months_back + 1):
+        keys.append(f"{year:04d}-{month:02d}")
+        month -= 1
+        if month == 0:
+            month = 12
+            year -= 1
+    return keys
+
+
+def aggregate_monthly(
+    conn: sqlite3.Connection, tzinfo: timezone, months_back: int
+) -> List[Tuple[str, int, int, int]]:
+    """
+    Aggregate totals by month for current month and previous months_back months.
+    Returns a list of (month_key, revenue, rebalance_cost, profit) sorted newest first.
+    """
+    if months_back < 0:
+        months_back = 0
+
+    today_local = datetime.now(tzinfo).date()
+    keys = month_keys(today_local, months_back)
+
+    cur = conn.execute(
+        """
+        SELECT substr(date, 1, 7) as ym,
+               SUM(forward_fees_sat) as revenue,
+               SUM(rebalance_fees_sat) as cost,
+               SUM(net_profit_sat) as profit
+        FROM daily_fees
+        GROUP BY ym
+        """
+    )
+    rows = cur.fetchall()
+    totals = {row[0]: (int(row[1] or 0), int(row[2] or 0), int(row[3] or 0)) for row in rows}
+
+    result: List[Tuple[str, int, int, int]] = []
+    for key in keys:
+        revenue, cost, profit = totals.get(key, (0, 0, 0))
+        result.append((key, revenue, cost, profit))
+    return result
+
+
+def resolve_date_bounds(
+    args: argparse.Namespace, tz_name: Optional[str]
+) -> Optional[Tuple[date, date, timezone]]:
+    """
+    Determine the date range to process, capped at yesterday (local).
+    Returns (start_date, end_date, tzinfo).
+    """
+    tzinfo = resolve_timezone(tz_name)
+    today_local = datetime.now(tzinfo).date()
+    yesterday = today_local - timedelta(days=1)
+
+    if args.from_date and args.to_date:
+        try:
+            start_date = datetime.strptime(args.from_date, "%Y-%m-%d").date()
+            end_date = datetime.strptime(args.to_date, "%Y-%m-%d").date()
+        except ValueError:
+            print_error("Dates must be in YYYY-MM-DD format.")
+            return None
+    elif args.from_date or args.to_date:
+        print_error("Both --from and --to must be provided together.")
+        return None
+    else:
+        start_date = end_date = yesterday
+
+    if end_date > yesterday:
+        end_date = yesterday
+
+    if start_date > end_date:
+        print_error("Date range is empty (start is after end).")
+        return None
+
+    return start_date, end_date, tzinfo
 
 
 def create_grpc_channel(config: EnvConfig) -> Optional[grpc.Channel]:
@@ -496,6 +670,19 @@ def parse_args() -> argparse.Namespace:
         dest="tz_name",
         help="Optional IANA timezone name (defaults to TZ env or local).",
     )
+    parser.add_argument(
+        "--months",
+        dest="months",
+        type=int,
+        default=3,
+        help="Include current month plus this many previous months in monthly report.",
+    )
+    parser.add_argument(
+        "--db-path",
+        dest="db_path",
+        default="lnd_fees.sqlite",
+        help="Path to SQLite database file for cached daily results.",
+    )
     return parser.parse_args()
 
 
@@ -509,104 +696,119 @@ def main() -> None:
     if args.tz_name:
         env_cfg.tz_name = args.tz_name
 
-    if args.from_date and not args.to_date or args.to_date and not args.from_date:
-        print_error("Both --from and --to must be provided together.")
+    date_bounds = resolve_date_bounds(args, env_cfg.tz_name)
+    if date_bounds is None:
         sys.exit(1)
 
-    if args.from_date and args.to_date:
-        time_range = get_time_range_from_cli(args.from_date, args.to_date, env_cfg.tz_name)
-    else:
-        time_range = get_time_range_dminus1(env_cfg.tz_name)
+    start_date, end_date, tzinfo = date_bounds
+    conn = init_db(args.db_path)
 
-    if time_range is None:
-        sys.exit(1)
+    target_dates = iter_dates(start_date, end_date)
+    missing_dates = [d for d in target_dates if not day_exists(conn, d.isoformat())]
 
-    channel = create_grpc_channel(env_cfg)
-    if channel is None:
-        sys.exit(1)
+    lightning_stub = None
+    our_pubkey = ""
+    alias = ""
+    new_records: List[DailyFeeRecord] = []
 
-    lightning_stub = get_lnd_stub(channel)
+    if missing_dates:
+        channel = create_grpc_channel(env_cfg)
+        if channel is None:
+            sys.exit(1)
 
-    info = get_info(lightning_stub)
-    if info is None:
-        sys.exit(1)
-    our_pubkey, alias = info
+        lightning_stub = get_lnd_stub(channel)
 
-    total_forward_fees, per_channel = get_forward_fees(
-        lightning_stub, time_range.start_ts_utc, time_range.end_ts_utc
-    )
+        info = get_info(lightning_stub)
+        if info is None:
+            sys.exit(1)
+        our_pubkey, alias = info
 
-    total_rebalance_fees, rebalance_details = get_rebalance_fees(
-        lightning_stub, our_pubkey, time_range.start_ts_utc, time_range.end_ts_utc
-    )
+        for target_date in missing_dates:
+            tr = get_time_range_for_date(target_date, env_cfg.tz_name)
+            forward_fees, _ = get_forward_fees(
+                lightning_stub, tr.start_ts_utc, tr.end_ts_utc
+            )
+            rebalance_fees, _ = get_rebalance_fees(
+                lightning_stub, our_pubkey, tr.start_ts_utc, tr.end_ts_utc
+            )
+            net_profit = forward_fees - rebalance_fees
+            record = DailyFeeRecord(
+                date_str=target_date.isoformat(),
+                forward_fees_sat=forward_fees,
+                rebalance_fees_sat=rebalance_fees,
+                net_profit_sat=net_profit,
+                start_ts_utc=tr.start_ts_utc,
+                end_ts_utc=tr.end_ts_utc,
+            )
+            insert_daily_fee(conn, record)
+            new_records.append(record)
 
-    net_profit = total_forward_fees - total_rebalance_fees
+        conn.commit()
 
-    print_report(
+    monthly = aggregate_monthly(conn, tzinfo, args.months)
+    print_run_summary(
+        new_records=new_records,
+        start_date=start_date,
+        end_date=end_date,
+        tzinfo=tzinfo,
+        db_path=args.db_path,
+        months=args.months,
+        monthly_rows=monthly,
         alias=alias,
         pubkey=our_pubkey,
-        time_range=time_range,
-        forward_fees=total_forward_fees,
-        rebalance_fees=total_rebalance_fees,
-        net_profit=net_profit,
-        per_channel=per_channel,
-        rebalance_count=len(rebalance_details),
+        missing_count=len(missing_dates),
+        processed_count=len(new_records),
     )
 
 
-def print_report(
+def print_run_summary(
+    new_records: List[DailyFeeRecord],
+    start_date: date,
+    end_date: date,
+    tzinfo: timezone,
+    db_path: str,
+    months: int,
+    monthly_rows: List[Tuple[str, int, int, int]],
     alias: str,
     pubkey: str,
-    time_range: TimeRange,
-    forward_fees: int,
-    rebalance_fees: int,
-    net_profit: int,
-    per_channel: Dict[int, Dict[str, int]],
-    rebalance_count: int,
+    missing_count: int,
+    processed_count: int,
 ) -> None:
-    """Print a human-readable summary to stdout."""
-    start_local_str = time_range.start_local.strftime("%Y-%m-%d %H:%M:%S %Z")
-    end_local_str = time_range.end_local.strftime("%Y-%m-%d %H:%M:%S %Z")
-    start_utc_str = datetime.fromtimestamp(time_range.start_ts_utc, tz=timezone.utc).strftime(
-        "%Y-%m-%d %H:%M:%S UTC"
-    )
-    end_utc_str = datetime.fromtimestamp(time_range.end_ts_utc, tz=timezone.utc).strftime(
-        "%Y-%m-%d %H:%M:%S UTC"
-    )
+    """Print summary of this run plus monthly aggregation."""
+    tz_label = tzinfo.tzname(datetime.now(tzinfo)) or ""
+    print(f"Date window requested: {start_date.isoformat()} -> {end_date.isoformat()} (tz={tz_label})")
+    print(f"Database: {db_path}")
 
-    default_range_label = "custom range"
-    today_local = datetime.now(time_range.start_local.tzinfo).date()
-    yesterday = today_local - timedelta(days=1)
-    if (
-        time_range.start_local.date() == yesterday
-        and time_range.end_local.date() == yesterday
-    ):
-        default_range_label = "D-1"
-
-    print(f"Lightning daily fee report ({default_range_label})")
-    print(f"Node alias: {alias}")
-    print(f"Node pubkey: {pubkey}")
-    print(f"Date range (local): {start_local_str} -> {end_local_str}")
-    print(f"Date range (UTC):   {start_utc_str} -> {end_utc_str}")
-    print()
-    print("Forwarding fee income:")
-    print(f"  Total forward fees: {forward_fees} sats")
-    print()
-    print("Rebalancing fee costs:")
-    print(f"  Total rebalance fees: {rebalance_fees} sats")
-    print(f"  Rebalance payments counted: {rebalance_count}")
-    print()
-    print("Net routing profit (forwards - rebalances):")
-    print(f"  {net_profit} sats")
-
-    if per_channel:
-        print()
-        print("Per-channel outbound breakdown (chan_id, out_volume_sat, fees_sat):")
-        for chan_id, stats in sorted(per_channel.items(), key=lambda kv: kv[1]["fees_sat"], reverse=True):
+    if processed_count == 0:
+        if missing_count == 0:
+            print("No new daily rows inserted (database already up to date through requested range).")
+        else:
+            print("No daily rows inserted.")
+    else:
+        print(f"Inserted {processed_count} daily row(s):")
+        for rec in sorted(new_records, key=lambda r: r.date_str):
             print(
-                f"  {chan_id}: volume_out={stats['out_volume_sat']} sats, "
-                f"fees={stats['fees_sat']} sats"
+                f"  {rec.date_str}: forward={rec.forward_fees_sat} sats, "
+                f"rebalance={rec.rebalance_fees_sat} sats, net={rec.net_profit_sat} sats"
             )
+
+    if alias:
+        print(f"Node alias: {alias}")
+    if pubkey:
+        print(f"Node pubkey: {pubkey}")
+
+    print()
+    print_monthly_report(monthly_rows, months)
+
+
+def print_monthly_report(monthly_rows: List[Tuple[str, int, int, int]], months: int) -> None:
+    """Print monthly revenue/cost/profit for current + previous months."""
+    print(f"Monthly routing profit (current month + {months} previous):")
+    for month_key, revenue, cost, profit in monthly_rows:
+        print(
+            f"  {month_key}: revenue={revenue} sats, "
+            f"rebalance_cost={cost} sats, profit={profit} sats"
+        )
 
 
 if __name__ == "__main__":
