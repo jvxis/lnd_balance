@@ -23,7 +23,7 @@ python3 -m pip install -r requirements.txt
 
 ## Required environment variables
 Set these before running:
-- `LND_GRPC_HOST` (e.g. `127.0.0.1` or `jvx-minipc01`)
+- `LND_GRPC_HOST` (e.g. `127.0.0.1` or `localhost`)
 - `LND_GRPC_PORT` (e.g. `10009`)
 - `LND_TLS_CERT` (path to `tls.cert`)
 - `LND_MACAROON` (path to macaroon, typically `.../data/chain/bitcoin/mainnet/admin.macaroon`)
@@ -31,7 +31,7 @@ Set these before running:
 
 Example (Linux/macOS):
 ```bash
-export LND_GRPC_HOST=jvx-minipc01
+export LND_GRPC_HOST=localhost
 export LND_GRPC_PORT=10009
 export LND_TLS_CERT="/home/admin/.lnd/tls.cert"
 export LND_MACAROON="/home/admin/.lnd/data/chain/bitcoin/mainnet/admin.macaroon"
@@ -40,7 +40,7 @@ python3 lnd_daily_fees.py
 
 PowerShell example:
 ```powershell
-$env:LND_GRPC_HOST = "jvx-minipc01"
+$env:LND_GRPC_HOST = "name_machine"
 $env:LND_GRPC_PORT = "10009"
 $env:LND_TLS_CERT = "C:\Users\admin\.lnd\tls.cert"
 $env:LND_MACAROON = "C:\Users\admin\.lnd\data\chain\bitcoin\mainnet\admin.macaroon"
