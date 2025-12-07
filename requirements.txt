@@ -1,2 +1,4 @@
 # gRPC client runtime for LND access
 grpcio>=1.60.0
+# Protobuf runtime required by generated stubs (lightning_pb2*.py)
+protobuf>=4.21,<6
