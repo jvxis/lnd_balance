@@ -307,16 +307,32 @@ def aggregate_monthly(
     return result
 
 
+def first_day_for_months_back(today_local: date, months_back: int) -> date:
+    """Return the first day of the month that is `months_back` before the current month."""
+    months_back = max(months_back, 0)
+    year = today_local.year
+    month = today_local.month
+    for _ in range(months_back):
+        month -= 1
+        if month == 0:
+            month = 12
+            year -= 1
+    return date(year, month, 1)
+
+
 def resolve_date_bounds(
     args: argparse.Namespace, tz_name: Optional[str]
 ) -> Optional[Tuple[date, date, timezone]]:
     """
     Determine the date range to process, capped at yesterday (local).
+    If --from/--to not provided, backfills from the first day of the
+    month that is args.months months ago, through yesterday.
     Returns (start_date, end_date, tzinfo).
     """
     tzinfo = resolve_timezone(tz_name)
     today_local = datetime.now(tzinfo).date()
     yesterday = today_local - timedelta(days=1)
+    months_back = max(getattr(args, "months", 0) or 0, 0)
 
     if args.from_date and args.to_date:
         try:
@@ -329,7 +345,8 @@ def resolve_date_bounds(
         print_error("Both --from and --to must be provided together.")
         return None
     else:
-        start_date = end_date = yesterday
+        start_date = first_day_for_months_back(today_local, months_back)
+        end_date = yesterday
 
     if end_date > yesterday:
         end_date = yesterday

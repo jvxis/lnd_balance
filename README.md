@@ -48,7 +48,7 @@ python3 lnd_daily_fees.py
 ```
 
 ## Usage
-- Default: process yesterday (local time). Only days missing in the SQLite DB are fetched and stored.
+- Default: backfill from the first day of the month that is `--months` ago up to yesterday (local time). Only days missing in the SQLite DB are fetched and stored.
 - Custom date range (inclusive, capped at yesterday):
   ```bash
   python3 lnd_daily_fees.py --from 2025-12-01 --to 2025-12-03
