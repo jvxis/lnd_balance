@@ -257,15 +257,39 @@ def iter_dates(start_date: date, end_date: date) -> List[date]:
     return days
 
 
-def month_keys(current_date: date, months_back: int) -> List[str]:
+def fetch_daily_row(conn: sqlite3.Connection, date_str: str) -> Optional[DailyFeeRecord]:
+    """Fetch a stored daily record."""
+    cur = conn.execute(
+        """
+        SELECT date, forward_fees_sat, rebalance_fees_sat, net_profit_sat, start_ts_utc, end_ts_utc
+        FROM daily_fees
+        WHERE date = ?
+        """,
+        (date_str,),
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    return DailyFeeRecord(
+        date_str=row[0],
+        forward_fees_sat=int(row[1]),
+        rebalance_fees_sat=int(row[2]),
+        net_profit_sat=int(row[3]),
+        start_ts_utc=int(row[4]),
+        end_ts_utc=int(row[5]),
+    )
+
+
+def month_keys(current_date: date, months_total: int) -> List[str]:
     """
-    Return a list of YYYY-MM keys for current month plus N previous months.
-    months_back=0 yields only the current month.
+    Return a list of YYYY-MM keys for current month plus prior months, length = months_total.
+    months_total=1 yields only the current month.
     """
+    months_total = max(months_total, 1)
     keys: List[str] = []
     year = current_date.year
     month = current_date.month
-    for _ in range(months_back + 1):
+    for _ in range(months_total):
         keys.append(f"{year:04d}-{month:02d}")
         month -= 1
         if month == 0:
@@ -275,17 +299,17 @@ def month_keys(current_date: date, months_back: int) -> List[str]:
 
 
 def aggregate_monthly(
-    conn: sqlite3.Connection, tzinfo: timezone, months_back: int
+    conn: sqlite3.Connection, tzinfo: timezone, months_total: int
 ) -> List[Tuple[str, int, int, int]]:
     """
-    Aggregate totals by month for current month and previous months_back months.
-    Returns a list of (month_key, revenue, rebalance_cost, profit) sorted newest first.
+    Aggregate totals by month for current month and previous months.
+    Returns a list of (month_key, revenue, rebalance_cost, profit) sorted newest first,
+    with length == months_total.
     """
-    if months_back < 0:
-        months_back = 0
-
+    if months_total < 1:
+        months_total = 1
     today_local = datetime.now(tzinfo).date()
-    keys = month_keys(today_local, months_back)
+    keys = month_keys(today_local, months_total)
 
     cur = conn.execute(
         """
@@ -326,13 +350,14 @@ def resolve_date_bounds(
     """
     Determine the date range to process, capped at yesterday (local).
     If --from/--to not provided, backfills from the first day of the
-    month that is args.months months ago, through yesterday.
+    month that is (months_total-1) months ago, through yesterday.
     Returns (start_date, end_date, tzinfo).
     """
     tzinfo = resolve_timezone(tz_name)
     today_local = datetime.now(tzinfo).date()
     yesterday = today_local - timedelta(days=1)
-    months_back = max(getattr(args, "months", 0) or 0, 0)
+    months_total = max(getattr(args, "months", 1) or 1, 1)
+    months_back = months_total - 1
 
     if args.from_date and args.to_date:
         try:
@@ -692,7 +717,7 @@ def parse_args() -> argparse.Namespace:
         dest="months",
         type=int,
         default=3,
-        help="Include current month plus this many previous months in monthly report.",
+        help="Include current month plus this many previous months in monthly report (minimum 1 month total).",
     )
     parser.add_argument(
         "--db-path",
@@ -762,19 +787,24 @@ def main() -> None:
 
         conn.commit()
 
-    monthly = aggregate_monthly(conn, tzinfo, args.months)
+    months_total = max(args.months, 1)
+    monthly = aggregate_monthly(conn, tzinfo, months_total)
+    yesterday_local = datetime.now(tzinfo).date() - timedelta(days=1)
+    dminus1_record = fetch_daily_row(conn, yesterday_local.isoformat())
+
     print_run_summary(
         new_records=new_records,
         start_date=start_date,
         end_date=end_date,
         tzinfo=tzinfo,
         db_path=args.db_path,
-        months=args.months,
+        months=months_total,
         monthly_rows=monthly,
         alias=alias,
         pubkey=our_pubkey,
         missing_count=len(missing_dates),
         processed_count=len(new_records),
+        dminus1_record=dminus1_record,
     )
 
 
@@ -790,8 +820,9 @@ def print_run_summary(
     pubkey: str,
     missing_count: int,
     processed_count: int,
+    dminus1_record: Optional[DailyFeeRecord],
 ) -> None:
-    """Print summary of this run plus monthly aggregation."""
+    """Print summary of this run plus daily D-1 and monthly aggregation."""
     tz_label = tzinfo.tzname(datetime.now(tzinfo)) or ""
     print(f"Date window requested: {start_date.isoformat()} -> {end_date.isoformat()} (tz={tz_label})")
     print(f"Database: {db_path}")
@@ -815,17 +846,54 @@ def print_run_summary(
         print(f"Node pubkey: {pubkey}")
 
     print()
+    print_daily_report(dminus1_record, tzinfo)
+    print()
     print_monthly_report(monthly_rows, months)
 
 
 def print_monthly_report(monthly_rows: List[Tuple[str, int, int, int]], months: int) -> None:
-    """Print monthly revenue/cost/profit for current + previous months."""
-    print(f"Monthly routing profit (current month + {months} previous):")
-    for month_key, revenue, cost, profit in monthly_rows:
+    """Print monthly revenue/cost/profit for current month, last month, and remaining months."""
+    if not monthly_rows:
+        print("No monthly data available.")
+        return
+
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    print(f"Monthly routing profit snapshot (as of {today_str}):")
+
+    current = monthly_rows[0]
+    print(
+        f"  Current month ({current[0]}): revenue={current[1]} sats, "
+        f"rebalance_cost={current[2]} sats, profit={current[3]} sats"
+    )
+
+    if len(monthly_rows) >= 2:
+        last = monthly_rows[1]
         print(
-            f"  {month_key}: revenue={revenue} sats, "
-            f"rebalance_cost={cost} sats, profit={profit} sats"
+            f"  Last month ({last[0]}): revenue={last[1]} sats, "
+            f"rebalance_cost={last[2]} sats, profit={last[3]} sats"
         )
+
+    if len(monthly_rows) > 2:
+        print("  Previous months:")
+        for month_key, revenue, cost, profit in monthly_rows[2:]:
+            print(
+                f"    {month_key}: revenue={revenue} sats, "
+                f"rebalance_cost={cost} sats, profit={profit} sats"
+            )
+
+
+def print_daily_report(dminus1_record: Optional[DailyFeeRecord], tzinfo: timezone) -> None:
+    """Print D-1 daily profit."""
+    yesterday = datetime.now(tzinfo).date() - timedelta(days=1)
+    if dminus1_record is None:
+        print(f"D-1 ({yesterday.isoformat()}): no data stored.")
+        return
+    print("D-1 daily profit:")
+    print(
+        f"  {dminus1_record.date_str}: revenue={dminus1_record.forward_fees_sat} sats, "
+        f"rebalance_cost={dminus1_record.rebalance_fees_sat} sats, "
+        f"profit={dminus1_record.net_profit_sat} sats"
+    )
 
 
 if __name__ == "__main__":
