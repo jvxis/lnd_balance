@@ -1,0 +1,10 @@
+.env
+__pychache__/
+*.pyc
+.vscode/
+.idea/
+dist/
+build/
+*.egg-info/
+.env
+.DS_Store
