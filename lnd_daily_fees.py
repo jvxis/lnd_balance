@@ -34,6 +34,11 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None  # type: ignore[assignment]
+
 import grpc
 from zoneinfo import ZoneInfo
 
@@ -153,10 +158,42 @@ def pad(label: str, width: int = 26) -> str:
     return label.ljust(width)
 
 
+def load_dotenv_if_present(env_path: Optional[str] = None) -> None:
+    """
+    Load variables from a .env file without overriding existing environment values.
+    Attempts python-dotenv if available; otherwise falls back to a tiny parser.
+    """
+    candidate_paths = [env_path] if env_path else [".env", os.path.join(os.path.dirname(__file__), ".env")]
+    for path in candidate_paths:
+        if not path:
+            continue
+        if not os.path.exists(path):
+            continue
+        if load_dotenv:
+            load_dotenv(path, override=False)
+            return
+        # Minimal parser: KEY=VALUE with optional quotes; ignores comments/blank lines.
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                for raw_line in fh:
+                    line = raw_line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    value = value.strip().strip('"').strip("'")
+                    os.environ.setdefault(key, value)
+            return
+        except OSError:
+            continue
+
+
 def load_env_config() -> Optional[EnvConfig]:
     """
     Load required environment variables. Returns None if any are missing.
     """
+    load_dotenv_if_present()
+
     required_vars = ["LND_GRPC_HOST", "LND_GRPC_PORT", "LND_TLS_CERT", "LND_MACAROON"]
     missing = [name for name in required_vars if not os.environ.get(name)]
     if missing:

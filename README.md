@@ -29,6 +29,15 @@ Set these before running:
 - `LND_MACAROON` (path to macaroon, typically `.../data/chain/bitcoin/mainnet/admin.macaroon`)
 - Optional: `TZ` (IANA timezone like `America/Sao_Paulo`; defaults to local time)
 
+You can set them directly in the shell (examples below) **or** place them in a `.env` file in the repo root; the script loads `.env` automatically (uses `python-dotenv` if installed, otherwise a built-in minimal parser). Sample `.env`:
+```
+LND_GRPC_HOST=localhost
+LND_GRPC_PORT=10009
+LND_TLS_CERT="/home/admin/.lnd/tls.cert"
+LND_MACAROON="/home/admin/.lnd/data/chain/bitcoin/mainnet/admin.macaroon"
+# TZ=America/Sao_Paulo
+```
+
 Example (Linux/macOS):
 ```bash
 export LND_GRPC_HOST=localhost
