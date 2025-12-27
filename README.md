@@ -22,14 +22,17 @@ python3 -m pip install -r requirements.txt
 ```
 
 ## Required environment variables
-Set these before running:
+Set these before running. Recommended: create a `.env` file so you don't have to export variables every time.
 - `LND_GRPC_HOST` (e.g. `127.0.0.1` or `localhost`)
 - `LND_GRPC_PORT` (e.g. `10009`)
 - `LND_TLS_CERT` (path to `tls.cert`)
 - `LND_MACAROON` (path to macaroon, typically `.../data/chain/bitcoin/mainnet/admin.macaroon`)
 - Optional: `TZ` (IANA timezone like `America/Sao_Paulo`; defaults to local time)
 
-You can set them directly in the shell (examples below) **or** place them in a `.env` file in the repo root; the script loads `.env` automatically (uses `python-dotenv` if installed, otherwise a built-in minimal parser). Sample `.env`:
+### Option A: `.env` file (recommended)
+Create a `.env` file in the repo root (already in `.gitignore`) and run the script without exporting anything. The script loads `.env` automatically (uses `python-dotenv` if installed, otherwise a built-in minimal parser). Existing exported variables are not overridden.
+
+Sample `.env`:
 ```
 LND_GRPC_HOST=localhost
 LND_GRPC_PORT=10009
@@ -37,6 +40,14 @@ LND_TLS_CERT="/home/admin/.lnd/tls.cert"
 LND_MACAROON="/home/admin/.lnd/data/chain/bitcoin/mainnet/admin.macaroon"
 # TZ=America/Sao_Paulo
 ```
+
+Then just run:
+```bash
+python3 lnd_daily_fees.py
+```
+
+### Option B: export in the shell
+You can set them directly in the shell (examples below).
 
 Example (Linux/macOS):
 ```bash
